@@ -27,6 +27,7 @@ LAST_X_MONTHS = config.getint('DEFAULT', 'last_x_months', fallback=6)
 USE_ORG_REPOS = config.getboolean('DEFAULT', 'use_org_repos', fallback=False)
 ORGANIZATION = config.get('DEFAULT', 'organization', fallback='')
 REPOS_FILE = config.get('DEFAULT', 'repos_file', fallback='repos.txt')
+IGNORE_NO_EXTENSION = config.getboolean('DEFAULT', 'ignore_no_extension', fallback=False)
 
 # Debug settings
 DEBUG_MODE = config.getboolean('DEFAULT', 'debug_mode', fallback=False)
