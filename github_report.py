@@ -4,36 +4,39 @@ from dateutil.relativedelta import relativedelta
 import configparser
 import os
 import collections
-import argparse
+import urllib3
 
-# Argument parser for command-line inputs
-parser = argparse.ArgumentParser(description="GitHub Enterprise Commit Report Generator")
-parser.add_argument("--token", required=True, help="GitHub Personal Access Token")
-args = parser.parse_args()
+# Suppress SSL verification warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Load configuration (excluding token)
-config = configparser.ConfigParser(allow_no_value=True)
+# Load token from environment variable
+TOKEN = os.environ.get("GITHUB_PAT")
+if not TOKEN:
+    raise ValueError("GITHUB_PAT environment variable not set.")
+
+# Load configuration with fallback support
+config = configparser.ConfigParser(allow_no_value=True, inline_comment_prefixes=('#', ';'))
 config.read('config.properties')
 
 # GitHub API setup
-GITHUB_URL = config.get('DEFAULT', 'github_url')
-TOKEN = args.token  # Use token from command-line argument
-HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"}
+GITHUB_URL = config.get('DEFAULT', 'github_url', fallback='https://github.com/api/v3')
 
 # Report settings
-TIME_RANGE = config.get('DEFAULT', 'time_range')
-LAST_X_MONTHS = config.getint('DEFAULT', 'last_x_months')
-USE_ORG_REPOS = config.getboolean('DEFAULT', 'use_org_repos')
-ORGANIZATION = config.get('DEFAULT', 'organization') if USE_ORG_REPOS else None
-DEVS_FILE = config.get('DEFAULT', 'devs_file')
-REPOS_FILE = config.get('DEFAULT', 'repos_file')
+TIME_RANGE = config.get('DEFAULT', 'time_range', fallback='')
+LAST_X_MONTHS = config.getint('DEFAULT', 'last_x_months', fallback=6)
+USE_ORG_REPOS = config.getboolean('DEFAULT', 'use_org_repos', fallback=False)
+ORGANIZATION = config.get('DEFAULT', 'organization', fallback='')
+REPOS_FILE = config.get('DEFAULT', 'repos_file', fallback='repos.txt')
 
 # Debug settings
-DEBUG_MODE = config.getboolean('DEFAULT', 'debug_mode')
-DEBUG_DEV = config.get('DEFAULT', 'debug_dev')
-DEBUG_REPO = config.get('DEFAULT', 'debug_repo')
+DEBUG_MODE = config.getboolean('DEFAULT', 'debug_mode', fallback=False)
+DEBUG_DEV = config.get('DEFAULT', 'debug_dev', fallback='')
+DEBUG_REPO = config.get('DEFAULT', 'debug_repo', fallback='')
 
-# Language mapping (extension to language name)
+# Branches to analyze (hardcoded for now)
+TARGET_BRANCHES = ['main', 'develop']
+
+# Language mapping
 LANGUAGE_MAP = {
     "py": "Python",
     "js": "JavaScript",
@@ -59,11 +62,11 @@ LANGUAGE_MAP = {
 
 # Helper functions
 def load_file_lines(file_path):
+    """Load lines from a file, ignoring comments starting with # or ;."""
     with open(file_path, 'r') as f:
-        return [line.strip() for line in f if line.strip()]
+        return [line.strip() for line in f if line.strip() and not line.strip().startswith(('#', ';'))]
 
 def get_time_range():
-    """Parse and validate the time range from config."""
     if TIME_RANGE:
         try:
             start, end = TIME_RANGE.split(':')
@@ -81,30 +84,56 @@ def get_time_range():
         until = end.strftime('%Y-%m-%dT23:59:59Z')
         return since, until
 
+def probe_repositories(repos):
+    """Probe each repository to check if it exists and is accessible."""
+    valid_repos = []
+    for repo in repos:
+        url = f"{GITHUB_URL}/repos/{repo}"
+        try:
+            response = requests.head(url, headers=HEADERS, verify=False)
+            response.raise_for_status()
+            valid_repos.append(repo)
+        except requests.exceptions.RequestException as e:
+            print(f"Skipping repository '{repo}': {e}")
+    return valid_repos
+
 def get_org_repos(org):
     repos = []
     url = f"{GITHUB_URL}/orgs/{org}/repos?per_page=100"
     while url:
-        response = requests.get(url, headers=HEADERS)
+        response = requests.get(url, headers=HEADERS, verify=False)
         response.raise_for_status()
         repos.extend([repo['full_name'] for repo in response.json()])
         url = response.links.get('next', {}).get('url')
     return repos
 
 def get_commits(repo, author, since, until):
-    url = f"{GITHUB_URL}/repos/{repo}/commits?author={author}&since={since}&until={until}&per_page=100"
-    print(f"Fetching commits: {url}")
+    """Fetch commits for an author across specified branches."""
     commits = []
-    while url:
-        response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()
-        commits.extend(response.json())
-        url = response.links.get('next', {}).get('url')
+    seen_shas = set()  # Avoid duplicates across branches
+    for branch in TARGET_BRANCHES:
+        url = f"{GITHUB_URL}/repos/{repo}/commits?author={author}&sha={branch}&since={since}&until={until}&per_page=100"
+        while url:
+            try:
+                response = requests.get(url, headers=HEADERS, verify=False)
+                response.raise_for_status()
+                branch_commits = response.json()
+                for commit in branch_commits:
+                    sha = commit["sha"]
+                    if sha not in seen_shas:  # Skip duplicates
+                        commits.append(commit)
+                        seen_shas.add(sha)
+                url = response.links.get('next', {}).get('url')
+            except requests.exceptions.RequestException as e:
+                print(f"Warning: Could not fetch commits for branch '{branch}' in '{repo}': {e}")
+                break  # Move to next branch if this one fails
+    if DEBUG_MODE:
+        print(f"Fetched {len(commits)} unique commits for {author} in {repo} across {TARGET_BRANCHES}")
     return commits
 
 def get_commit_details(repo, sha):
     url = f"{GITHUB_URL}/repos/{repo}/commits/{sha}"
-    response = requests.get(url, headers=HEADERS)
+    response = requests.get(url, headers=HEADERS, verify=False)
     response.raise_for_status()
     return response.json()
 
@@ -181,14 +210,22 @@ def print_cloc_style_report(report, per_repo=False):
 # Main execution
 if __name__ == "__main__":
     since, until = get_time_range()
-    devs = load_file_lines(DEVS_FILE)
+    devs = load_file_lines("devs.txt")
     repos = get_org_repos(ORGANIZATION) if USE_ORG_REPOS else load_file_lines(REPOS_FILE)
 
-    if DEBUG_MODE:
-        devs = [DEBUG_DEV]
-        repos = [DEBUG_REPO]
-        print(f"Debug Mode: Testing {DEBUG_DEV} on {DEBUG_REPO}")
+    # Probe repositories first
+    print("Probing repositories...")
+    valid_repos = probe_repositories(repos)
+    if not valid_repos:
+        print("No valid repositories found. Exiting.")
+        exit(1)
+    print(f"Found {len(valid_repos)} valid repositories: {', '.join(valid_repos)}")
 
-    print(f"Generating report for {since} to {until}")
-    report = generate_report(devs, repos, since, until, per_repo=True)
+    if DEBUG_MODE:
+        devs = [DEBUG_DEV] if DEBUG_DEV else devs[:1]
+        repos = [DEBUG_REPO] if DEBUG_REPO in valid_repos else valid_repos[:1]
+        print(f"Debug Mode: Testing {devs[0]} on {repos[0]}")
+
+    print(f"Generating report for {since} to {until} across branches {TARGET_BRANCHES}")
+    report = generate_report(devs, valid_repos, since, until, per_repo=True)
     print_cloc_style_report(report, per_repo=True)
