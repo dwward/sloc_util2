@@ -4,14 +4,20 @@ from dateutil.relativedelta import relativedelta
 import configparser
 import os
 import collections
+import argparse
 
-# Load configuration
+# Argument parser for command-line inputs
+parser = argparse.ArgumentParser(description="GitHub Enterprise Commit Report Generator")
+parser.add_argument("--token", required=True, help="GitHub Personal Access Token")
+args = parser.parse_args()
+
+# Load configuration (excluding token)
 config = configparser.ConfigParser(allow_no_value=True)
 config.read('config.properties')
 
 # GitHub API setup
 GITHUB_URL = config.get('DEFAULT', 'github_url')
-TOKEN = config.get('DEFAULT', 'token')
+TOKEN = args.token  # Use token from command-line argument
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"}
 
 # Report settings
@@ -57,13 +63,23 @@ def load_file_lines(file_path):
         return [line.strip() for line in f if line.strip()]
 
 def get_time_range():
+    """Parse and validate the time range from config."""
     if TIME_RANGE:
-        start, end = TIME_RANGE.split(':')
-        return start, end
+        try:
+            start, end = TIME_RANGE.split(':')
+            datetime.strptime(start, '%Y-%m-%d')
+            datetime.strptime(end, '%Y-%m-%d')
+            since = f"{start}T00:00:00Z"
+            until = f"{end}T23:59:59Z"
+            return since, until
+        except ValueError as e:
+            raise ValueError(f"Invalid time_range format in config.properties. Use YYYY-MM-DD:YYYY-MM-DD. Error: {e}")
     else:
         end = datetime.now()
         start = end - relativedelta(months=LAST_X_MONTHS)
-        return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
+        since = start.strftime('%Y-%m-%dT00:00:00Z')
+        until = end.strftime('%Y-%m-%dT23:59:59Z')
+        return since, until
 
 def get_org_repos(org):
     repos = []
@@ -77,6 +93,7 @@ def get_org_repos(org):
 
 def get_commits(repo, author, since, until):
     url = f"{GITHUB_URL}/repos/{repo}/commits?author={author}&since={since}&until={until}&per_page=100"
+    print(f"Fetching commits: {url}")
     commits = []
     while url:
         response = requests.get(url, headers=HEADERS)
@@ -137,26 +154,18 @@ def print_cloc_style_report(report, per_repo=False):
         print(f"\n{'='*80}")
         print(f"Developer: {dev}")
         print(f"{'='*80}")
-        
-        # CLOC-style header
         print(f"{'Language':<20} {'Files Modified':<15} {'Added':<10} {'Deleted':<10} {'Total Changes':<15}")
         print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*15}")
-        
-        # By file type (CLOC-style)
         file_count = collections.defaultdict(int)
         for commit in data["by_repo"].values():
             for ext in commit:
-                file_count[ext] += 1  # Approximate file count (not exact due to API limitations)
+                file_count[ext] += 1
         for ext, stats in data["by_file_type"].items():
             lang = LANGUAGE_MAP.get(ext, ext)
             print(f"{lang:<20} {file_count[ext]:<15} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
-        
-        # Totals
         print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*15}")
         total_files = sum(file_count.values())
         print(f"{'SUM':<20} {total_files:<15} {data['total']['additions']:<10} {data['total']['deletions']:<10} {data['total']['changes']:<15}")
-        
-        # By repository (if requested)
         if per_repo:
             print(f"\n{'-'*80}")
             print("By Repository:")
