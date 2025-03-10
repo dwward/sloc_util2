@@ -139,32 +139,63 @@ def get_commit_details(repo, sha):
 
 def analyze_commits(repo, author, since, until):
     commits = get_commits(repo, author, since, until)
-    file_type_stats = collections.defaultdict(lambda: {"additions": 0, "deletions": 0, "changes": 0})
-    per_repo_stats = {repo: collections.defaultdict(lambda: {"additions": 0, "deletions": 0, "changes": 0})}
+    file_type_stats = collections.defaultdict(lambda: {
+        "additions": 0, "deletions": 0, "changes": 0,
+        "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+    })
+    per_repo_stats = {repo: collections.defaultdict(lambda: {
+        "additions": 0, "deletions": 0, "changes": 0,
+        "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+    })}
 
     for commit in commits:
         sha = commit["sha"]
         commit_data = get_commit_details(repo, sha)
         for file in commit_data.get("files", []):
             ext = file["filename"].split(".")[-1] if "." in file["filename"] else "no_extension"
+            # Skip files without extensions if configured
+            if IGNORE_NO_EXTENSION and ext == "no_extension":
+                continue
             additions = file.get("additions", 0)
             deletions = file.get("deletions", 0)
             changes = file.get("changes", 0)
+            status = file.get("status", "")
+
+            # Update line stats
             file_type_stats[ext]["additions"] += additions
             file_type_stats[ext]["deletions"] += deletions
             file_type_stats[ext]["changes"] += changes
             per_repo_stats[repo][ext]["additions"] += additions
             per_repo_stats[repo][ext]["deletions"] += deletions
             per_repo_stats[repo][ext]["changes"] += changes
+
+            # Update file status counts
+            if status == "modified":
+                file_type_stats[ext]["modifications"] += 1
+                per_repo_stats[repo][ext]["modifications"] += 1
+            elif status == "added":
+                file_type_stats[ext]["added"] += 1
+                per_repo_stats[repo][ext]["added"] += 1
+            elif status == "removed":
+                file_type_stats[ext]["removed"] += 1
+                per_repo_stats[repo][ext]["removed"] += 1
+            elif status == "renamed":
+                file_type_stats[ext]["renamed"] += 1
+                per_repo_stats[repo][ext]["renamed"] += 1
+
     return file_type_stats, per_repo_stats
 
 def generate_report(devs, repos, since, until, per_repo=False):
     report = {}
     for dev in devs:
         report[dev] = {
-            "total": {"additions": 0, "deletions": 0, "changes": 0},
-            "by_file_type": collections.defaultdict(lambda: {"additions": 0, "deletions": 0, "changes": 0}),
-            "by_repo": collections.defaultdict(lambda: collections.defaultdict(lambda: {"additions": 0, "deletions": 0, "changes": 0}))
+            "total": {"additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0},
+            "by_file_type": collections.defaultdict(lambda: {
+                "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+            }),
+            "by_repo": collections.defaultdict(lambda: collections.defaultdict(lambda: {
+                "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+            }))
         }
         for repo in repos:
             file_stats, repo_stats = analyze_commits(repo, dev, since, until)
@@ -180,32 +211,122 @@ def generate_report(devs, repos, since, until, per_repo=False):
 
 def print_cloc_style_report(report, per_repo=False):
     for dev, data in report.items():
-        print(f"\n{'='*80}")
+        print(f"\n{'='*100}")
         print(f"Developer: {dev}")
-        print(f"{'='*80}")
-        print(f"{'Language':<20} {'Files Modified':<15} {'Added':<10} {'Deleted':<10} {'Total Changes':<15}")
-        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*15}")
-        file_count = collections.defaultdict(int)
-        for commit in data["by_repo"].values():
-            for ext in commit:
-                file_count[ext] += 1
+        print(f"{'='*100}")
+        print(f"{'Language':<20} {'Modifications':<15} {'Added':<10} {'Removed':<10} {'Renamed':<10} {'Line Adds':<10} {'Line Dels':<10} {'Line Changes':<15}")
+        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
         for ext, stats in data["by_file_type"].items():
             lang = LANGUAGE_MAP.get(ext, ext)
-            print(f"{lang:<20} {file_count[ext]:<15} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
-        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*15}")
-        total_files = sum(file_count.values())
-        print(f"{'SUM':<20} {total_files:<15} {data['total']['additions']:<10} {data['total']['deletions']:<10} {data['total']['changes']:<15}")
+            print(f"{lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
+        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+        print(f"{'SUM':<20} {data['total']['modifications']:<15} {data['total']['added']:<10} {data['total']['removed']:<10} {data['total']['renamed']:<10} {data['total']['additions']:<10} {data['total']['deletions']:<10} {data['total']['changes']:<15}")
         if per_repo:
-            print(f"\n{'-'*80}")
-            print("By Repository:")
-            print(f"{'-'*80}")
+            print(f"\n{'-'*100}")
+            print(f"    By Repository:")
+            print(f"    {'-'*96}")
             for repo, ext_stats in data["by_repo"].items():
-                print(f"\nRepository: {repo}")
-                print(f"{'Language':<20} {'Added':<10} {'Deleted':<10} {'Total Changes':<15}")
-                print(f"{'-'*20} {'-'*10} {'-'*10} {'-'*15}")
+                print(f"\n    Repository: {repo}")
+                print(f"    {'Language':<20} {'Modifications':<15} {'Added':<10} {'Removed':<10} {'Renamed':<10} {'Line Adds':<10} {'Line Dels':<10} {'Line Changes':<15}")
+                print(f"    {'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
                 for ext, stats in ext_stats.items():
                     lang = LANGUAGE_MAP.get(ext, ext)
-                    print(f"{lang:<20} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
+                    print(f"    {lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
+def analyze_commits(repo, author, since, until):
+    commits = get_commits(repo, author, since, until)
+    file_type_stats = collections.defaultdict(lambda: {
+        "additions": 0, "deletions": 0, "changes": 0,
+        "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+    })
+    per_repo_stats = {repo: collections.defaultdict(lambda: {
+        "additions": 0, "deletions": 0, "changes": 0,
+        "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+    })}
+
+    for commit in commits:
+        sha = commit["sha"]
+        commit_data = get_commit_details(repo, sha)
+        for file in commit_data.get("files", []):
+            ext = file["filename"].split(".")[-1] if "." in file["filename"] else "no_extension"
+            # Skip files without extensions if configured
+            if IGNORE_NO_EXTENSION and ext == "no_extension":
+                continue
+            additions = file.get("additions", 0)
+            deletions = file.get("deletions", 0)
+            changes = file.get("changes", 0)
+            status = file.get("status", "")
+
+            # Update line stats
+            file_type_stats[ext]["additions"] += additions
+            file_type_stats[ext]["deletions"] += deletions
+            file_type_stats[ext]["changes"] += changes
+            per_repo_stats[repo][ext]["additions"] += additions
+            per_repo_stats[repo][ext]["deletions"] += deletions
+            per_repo_stats[repo][ext]["changes"] += changes
+
+            # Update file status counts
+            if status == "modified":
+                file_type_stats[ext]["modifications"] += 1
+                per_repo_stats[repo][ext]["modifications"] += 1
+            elif status == "added":
+                file_type_stats[ext]["added"] += 1
+                per_repo_stats[repo][ext]["added"] += 1
+            elif status == "removed":
+                file_type_stats[ext]["removed"] += 1
+                per_repo_stats[repo][ext]["removed"] += 1
+            elif status == "renamed":
+                file_type_stats[ext]["renamed"] += 1
+                per_repo_stats[repo][ext]["renamed"] += 1
+
+    return file_type_stats, per_repo_stats
+
+def generate_report(devs, repos, since, until, per_repo=False):
+    report = {}
+    for dev in devs:
+        report[dev] = {
+            "total": {"additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0},
+            "by_file_type": collections.defaultdict(lambda: {
+                "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+            }),
+            "by_repo": collections.defaultdict(lambda: collections.defaultdict(lambda: {
+                "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+            }))
+        }
+        for repo in repos:
+            file_stats, repo_stats = analyze_commits(repo, dev, since, until)
+            for ext, stats in file_stats.items():
+                for key in stats:
+                    report[dev]["by_file_type"][ext][key] += stats[key]
+                    report[dev]["total"][key] += stats[key]
+            for repo_name, ext_stats in repo_stats.items():
+                for ext, stats in ext_stats.items():
+                    for key in stats:
+                        report[dev]["by_repo"][repo_name][ext][key] += stats[key]
+    return report
+
+def print_cloc_style_report(report, per_repo=False):
+    for dev, data in report.items():
+        print(f"\n{'='*100}")
+        print(f"Developer: {dev}")
+        print(f"{'='*100}")
+        print(f"{'Language':<20} {'Modifications':<15} {'Added':<10} {'Removed':<10} {'Renamed':<10} {'Line Adds':<10} {'Line Dels':<10} {'Line Changes':<15}")
+        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+        for ext, stats in data["by_file_type"].items():
+            lang = LANGUAGE_MAP.get(ext, ext)
+            print(f"{lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
+        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+        print(f"{'SUM':<20} {data['total']['modifications']:<15} {data['total']['added']:<10} {data['total']['removed']:<10} {data['total']['renamed']:<10} {data['total']['additions']:<10} {data['total']['deletions']:<10} {data['total']['changes']:<15}")
+        if per_repo:
+            print(f"\n{'-'*100}")
+            print(f"    By Repository:")
+            print(f"    {'-'*96}")
+            for repo, ext_stats in data["by_repo"].items():
+                print(f"\n    Repository: {repo}")
+                print(f"    {'Language':<20} {'Modifications':<15} {'Added':<10} {'Removed':<10} {'Renamed':<10} {'Line Adds':<10} {'Line Dels':<10} {'Line Changes':<15}")
+                print(f"    {'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+                for ext, stats in ext_stats.items():
+                    lang = LANGUAGE_MAP.get(ext, ext)
+                    print(f"    {lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
 
 # Main execution
 if __name__ == "__main__":
