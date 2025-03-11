@@ -7,7 +7,7 @@ import collections
 import argparse
 import urllib3
 import json
-import re  # Added for email extraction
+import re
 
 # Parse Access Token
 TOKEN = os.environ.get("GITHUB_PAT")
@@ -109,8 +109,26 @@ def get_org_repos(org):
         url = response.links.get('next', {}).get('url')
     return repos
 
+def validate_token():
+    """Validate the token with a simple GraphQL query."""
+    query = "query { viewer { login } }"
+    try:
+        response = SESSION.post(GRAPHQL_URL, json={"query": query}, verify=not DISABLE_SSL, timeout=(5.0, 30.0))
+        response.raise_for_status()
+        data = response.json()
+        print(f"Token validated successfully. User: {data['data']['viewer']['login']}")
+    except requests.exceptions.HTTPError as e:
+        print(f"Token validation failed: {e}")
+        if 'response' in locals():
+            print(f"Status Code: {response.status_code}")
+            print(f"Response Text: {response.text}")
+        raise
+    except requests.exceptions.RequestException as e:
+        print(f"Unexpected error during token validation: {e}")
+        raise
+
 def get_commits_graphql(repos, author, since, until):
-    """Fetch commits for an author across multiple repositories using GraphQL."""
+    """Fetch commits for an author across multiple repositories using GraphQL with pagination."""
     cache_key = (tuple(repos), author, since, until)
     if cache_key in COMMITS_CACHE:
         print(f"Cache hit for {author} across {len(repos)} repos")
@@ -118,91 +136,122 @@ def get_commits_graphql(repos, author, since, until):
 
     print(f"Fetching GraphQL data for {author} across {len(repos)} repos...")
     print(f"Querying branches: {TARGET_BRANCHES}, since: {since}, until: {until}")
-    query_parts = []
-    variables = {"since": since, "until": until}
-    for i, repo in enumerate(repos):
-        org, repo_name = repo.split('/')
-        query_parts.append(
-            f'repo{i}: repository(owner: "{org}", name: "{repo_name}") {{\n'
-            f'  refs(refPrefix: "refs/heads/", first: 100) {{\n'
-            f'    nodes {{\n'
-            f'      name\n'
-            f'      target {{\n'
-            f'        ... on Commit {{\n'
-            f'          history(first: 100, since: $since, until: $until) {{\n'
-            f'            nodes {{\n'
-            f'              oid\n'
-            f'              additions\n'
-            f'              deletions\n'
-            f'              changedFilesIfAvailable\n'
-            f'              committedDate\n'
-            f'              author {{\n'
-            f'                name\n'
-            f'                email\n'
-            f'                user {{\n'
-            f'                  login\n'
-            f'                }}\n'
-            f'              }}\n'
-            f'            }}\n'
-            f'            pageInfo {{ endCursor, hasNextPage }}\n'
-            f'          }}\n'
-            f'        }}\n'
-            f'      }}\n'
-            f'    }}\n'
-            f'  }}\n'
-            f'}}'
-        )
-    query = "query($since: GitTimestamp!, $until: GitTimestamp!) {\n" + "\n".join(query_parts) + "\n}"
-
-    try:
-        response = SESSION.post(GRAPHQL_URL, json={"query": query, "variables": variables}, verify=not DISABLE_SSL, timeout=(0.5, 10.0))
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"GraphQL request failed for {author}: {e}")
-        print(f"Response text: {response.text}")
-        return {}
-
-    data = response.json()
-    print(f"GraphQL Response for {author}: {json.dumps(data, indent=2)}")
-
     commits_by_repo = {}
-    for i, repo in enumerate(repos):
-        repo_key = f"repo{i}"
-        repo_data = data.get("data", {}).get(repo_key, {})
-        commits_by_repo[repo] = []
-        refs = repo_data.get("refs", {}).get("nodes", [])
-        if not refs and DEBUG_MODE:
-            print(f"No branches found in {repo}")
-        for ref in refs:
-            branch_name = ref.get("name", "unknown")
+    
+    for repo in repos[:5] if DEBUG_MODE else repos:  # Limit to 5 repos in debug mode
+        org, repo_name = repo.split('/')
+        after_cursor = None
+        repo_commits = []
+        
+        while True:
+            query = (
+                f'query($since: GitTimestamp!, $until: GitTimestamp!, $after: String) {{\n'
+                f'  repository(owner: "{org}", name: "{repo_name}") {{\n'
+                f'    refs(refPrefix: "refs/heads/", first: 50, after: $after) {{\n'  # Reduced to 50
+                f'      nodes {{\n'
+                f'        name\n'
+                f'        target {{\n'
+                f'          ... on Commit {{\n'
+                f'            history(first: 50, since: $since, until: $until) {{\n'  # Reduced to 50
+                f'              nodes {{\n'
+                f'                oid\n'
+                f'                additions\n'
+                f'                deletions\n'
+                f'                changedFilesIfAvailable\n'
+                f'                committedDate\n'
+                f'                author {{\n'
+                f'                  name\n'
+                f'                  email\n'
+                f'                  user {{\n'
+                f'                    login\n'
+                f'                  }}\n'
+                f'                }}\n'
+                f'              }}\n'
+                f'              pageInfo {{\n'
+                f'                endCursor\n'
+                f'                hasNextPage\n'
+                f'              }}\n'
+                f'            }}\n'
+                f'          }}\n'
+                f'        }}\n'
+                f'      }}\n'
+                f'      pageInfo {{\n'
+                f'        endCursor\n'
+                f'        hasNextPage\n'
+                f'      }}\n'
+                f'    }}\n'
+                f'  }}\n'
+                f'}}'
+            )
+            variables = {"since": since, "until": until, "after": after_cursor}
+
+            response = None
+            try:
+                response = SESSION.post(GRAPHQL_URL, json={"query": query, "variables": variables}, verify=not DISABLE_SSL, timeout=(5.0, 30.0))
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                print(f"GraphQL request failed for {repo}: {e}")
+                if response:
+                    print(f"Status Code: {response.status_code}")
+                    print(f"Response Headers: {response.headers}")
+                    print(f"Response Text: {response.text}")
+                else:
+                    print("No response received due to HTTP error")
+                break
+            except requests.exceptions.Timeout as e:
+                print(f"Timeout error for {repo}: {e}")
+                break
+            except requests.exceptions.RequestException as e:
+                print(f"Network error for {repo}: {e}")
+                break
+
+            if not response:
+                break
+
+            data = response.json()
             if DEBUG_MODE:
-                print(f"Found branch in {repo}: {branch_name}")
-            history = ref.get("target", {}).get("history", {}).get("nodes", [])
-            if not history and DEBUG_MODE:
-                print(f"No commits found in {repo} on branch {branch_name} between {since} and {until}")
-            for commit in history:
-                commit_login = commit.get("author", {}).get("user", {}).get("login", "")
-                commit_email_raw = commit.get("author", {}).get("email", "")
-                commit_name = commit.get("author", {}).get("name", "")
-                # Extract email from "Full Name <email@example.com>" format
-                commit_email_match = re.search(r'<(.+?)>', commit_email_raw) if commit_email_raw else None
-                commit_email = commit_email_match.group(1) if commit_email_match else commit_email_raw
+                print(f"GraphQL Response for {repo}: {json.dumps(data, indent=2)}")
+
+            repo_data = data.get("data", {}).get("repository", {})
+            refs = repo_data.get("refs", {}).get("nodes", [])
+            if not refs and DEBUG_MODE:
+                print(f"No branches found in {repo}")
+
+            for ref in refs:
+                branch_name = ref.get("name", "unknown")
                 if DEBUG_MODE:
-                    print(f"Commit in {repo}: login={commit_login or 'None'}, email_raw={commit_email_raw or 'None'}, email={commit_email or 'None'}, name={commit_name or 'None'}")
-                # Case-insensitive match
-                if (commit_login.lower() == author.lower() or 
-                    (commit_email and commit_email.lower() == author.lower()) or 
-                    (commit_email and commit_email.split('@')[0].lower() == author.lower())):
-                    commit_data = {
-                        "sha": commit["oid"],
-                        "stats": {
-                            "additions": commit.get("additions", 0),
-                            "deletions": commit.get("deletions", 0),
-                            "total": commit.get("changedFilesIfAvailable", 0)
-                        },
-                        "files": []  # Placeholder; fetch with REST
-                    }
-                    commits_by_repo[repo].append(commit_data)
+                    print(f"Found branch in {repo}: {branch_name}")
+                history = ref.get("target", {}).get("history", {}).get("nodes", [])
+                if not history and DEBUG_MODE:
+                    print(f"No commits found in {repo} on branch {branch_name} between {since} and {until}")
+                for commit in history:
+                    commit_login = commit.get("author", {}).get("user", {}).get("login", "")
+                    commit_email_raw = commit.get("author", {}).get("email", "")
+                    commit_name = commit.get("author", {}).get("name", "")
+                    commit_email_match = re.search(r'<(.+?)>', commit_email_raw) if commit_email_raw else None
+                    commit_email = commit_email_match.group(1) if commit_email_match else commit_email_raw
+                    if DEBUG_MODE:
+                        print(f"Commit in {repo}: login={commit_login or 'None'}, email_raw={commit_email_raw or 'None'}, email={commit_email or 'None'}, name={commit_name or 'None'}")
+                    if (commit_login.lower() == author.lower() or 
+                        (commit_email and commit_email.lower() == author.lower()) or 
+                        (commit_email and commit_email.split('@')[0].lower() == author.lower())):
+                        commit_data = {
+                            "sha": commit["oid"],
+                            "stats": {
+                                "additions": commit.get("additions", 0),
+                                "deletions": commit.get("deletions", 0),
+                                "total": commit.get("changedFilesIfAvailable", 0)
+                            },
+                            "files": []
+                        }
+                        repo_commits.append(commit_data)
+
+            page_info = repo_data.get("refs", {}).get("pageInfo", {})
+            if not page_info.get("hasNextPage", False):
+                break
+            after_cursor = page_info.get("endCursor")
+
+        commits_by_repo[repo] = repo_commits
 
     COMMITS_CACHE[cache_key] = commits_by_repo
     total_commits = sum(len(commits) for commits in commits_by_repo.values())
@@ -211,7 +260,7 @@ def get_commits_graphql(repos, author, since, until):
 
 def get_commit_details(repo, sha):
     url = f"{GITHUB_URL}/repos/{repo}/commits/{sha}"
-    response = SESSION.get(url, verify=not DISABLE_SSL)
+    response = SESSION.get(url, verify=not DISABLE_SSL, timeout=(5.0, 30.0))
     response.raise_for_status()
     return response.json()
 
@@ -315,6 +364,9 @@ def print_cloc_style_report(report, per_repo=PER_REPO):
                     print(f"    {lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
 
 if __name__ == "__main__":
+    print("Validating token...")
+    validate_token()
+    
     since, until = get_time_range()
     devs = load_file_lines(DEVS_FILE)
     repos = get_org_repos(ORGANIZATION) if USE_ORG_REPOS else load_file_lines(REPOS_FILE)
