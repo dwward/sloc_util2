@@ -7,6 +7,9 @@ import collections
 import argparse
 import urllib3
 
+### PARALLELIZATION CHANGE: Import threading and concurrent.futures for parallel execution
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Parse Access Token from either an environment variable or a parameter
 TOKEN = os.environ.get("GITHUB_PAT")
@@ -20,11 +23,9 @@ if not TOKEN:
 if not TOKEN:
     raise ValueError("Personal Access Token is not set.  Set GITHUB_PAT as environment variable, or pass as parameter using '--token <token>' ")
 
-
 # Load configuration (excluding token)
 config = configparser.ConfigParser(allow_no_value=True, inline_comment_prefixes=('#', ';'))
 config.read('config.properties')
-
 
 # Supress SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning) # TODO: put this in an error log
@@ -45,7 +46,6 @@ TARGET_BRANCHES = config.get('DEFAULT', 'branches', fallback='main').split(',')
 IGNORE_NO_EXTENSION = config.getboolean('DEFAULT', 'ignore_no_extension', fallback=False)
 SHOW_REPO_STATS = config.getboolean('DEFAULT', 'show_repo_states', fallback=False)
 PER_REPO = config.getboolean('DEFAULT', 'show_repo_stats', fallback=True)
-
 
 # Debug settings
 DEBUG_MODE = config.getboolean('DEFAULT', 'debug_mode')
@@ -110,7 +110,6 @@ def probe_repositories(repos):
     valid_repos = []
     for repo in repos:
         url = f"{GITHUB_URL}/repos/{repo}"
-
         try:
             # HEAD request, minimal transfer
             response = requests.head(url, headers=HEADERS, verify=False) # TODO: Make this a flag, and find SSL fix
@@ -210,8 +209,40 @@ def analyze_commits(repo, author, since, until):
 
     return file_type_stats, per_repo_stats
 
+### PARALLELIZATION CHANGE: Helper function to process a single dev-repo pair
+def process_dev_repo_pair(dev, repo, since, until, per_repo):
+    """Process a single developer-repo pair and return stats for merging."""
+    file_stats, repo_stats = analyze_commits(repo, dev, since, until)
+    dev_stats = {
+        "total": {"additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0},
+        "by_file_type": collections.defaultdict(lambda: {
+            "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+        })
+    }
+    if per_repo:
+        dev_stats["by_repo"] = collections.defaultdict(lambda: collections.defaultdict(lambda: {
+            "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+        }))
+
+    # Aggregate file stats
+    for ext, stats in file_stats.items():
+        for key in stats:
+            dev_stats["by_file_type"][ext][key] += stats[key]
+            dev_stats["total"][key] += stats[key]
+
+    # Aggregate repo stats if per_repo is enabled
+    if per_repo:
+        for repo_name, ext_stats in repo_stats.items():
+            for ext, stats in ext_stats.items():
+                for key in stats:
+                    dev_stats["by_repo"][repo_name][ext][key] += stats[key]
+
+    return dev, dev_stats
+
+### PARALLELIZATION CHANGE: Modified generate_report to use ThreadPoolExecutor
 def generate_report(devs, repos, since, until, per_repo=PER_REPO):
     report = {}
+    # Initialize report structure for each developer
     for dev in devs:
         report[dev] = {
             "total": {"additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0},
@@ -219,26 +250,39 @@ def generate_report(devs, repos, since, until, per_repo=PER_REPO):
                 "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
             })
         }
-        # Only initialize by_repo if per_repo is True
         if per_repo:
             report[dev]["by_repo"] = collections.defaultdict(lambda: collections.defaultdict(lambda: {
                 "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
             }))
 
-        for repo in repos:
-            file_stats, repo_stats = analyze_commits(repo, dev, since, until)
-            for ext, stats in file_stats.items():
-                for key in stats:
-                    report[dev]["by_file_type"][ext][key] += stats[key]
-                    report[dev]["total"][key] += stats[key]
-            # Only aggregate by_repo if per_repo is True
-            if per_repo:
-                for repo_name, ext_stats in repo_stats.items():
-                    for ext, stats in ext_stats.items():
-                        for key in stats:
-                            report[dev]["by_repo"][repo_name][ext][key] += stats[key]
-    return report
+    # Create a thread pool to process dev-repo pairs in parallel
+    max_workers = min(10, len(devs) * len(repos))  # Cap at 10 or total pairs, whichever is smaller
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit tasks for each dev-repo pair
+        future_to_pair = {
+            executor.submit(process_dev_repo_pair, dev, repo, since, until, per_repo): (dev, repo)
+            for dev in devs for repo in repos
+        }
 
+        # Collect results as they complete
+        for future in as_completed(future_to_pair):
+            dev, repo = future_to_pair[future]
+            try:
+                dev_result_dev, dev_result_stats = future.result()
+                # Merge results into the shared report (critical section)
+                for ext, stats in dev_result_stats["by_file_type"].items():
+                    for key in stats:
+                        report[dev]["by_file_type"][ext][key] += stats[key]
+                        report[dev]["total"][key] += stats[key]
+                if per_repo:
+                    for repo_name, ext_stats in dev_result_stats["by_repo"].items():
+                        for ext, stats in ext_stats.items():
+                            for key in stats:
+                                report[dev]["by_repo"][repo_name][ext][key] += stats[key]
+            except Exception as e:
+                print(f"Error processing {dev}/{repo}: {e}")  # TODO: Log this properly
+
+    return report
 
 def print_cloc_style_report(report, per_repo=PER_REPO):
     for dev, data in report.items():
@@ -263,8 +307,6 @@ def print_cloc_style_report(report, per_repo=PER_REPO):
                 for ext, stats in ext_stats.items():
                     lang = LANGUAGE_MAP.get(ext, ext)
                     print(f"    {lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
-
-
 
 # Main execution
 if __name__ == "__main__":
