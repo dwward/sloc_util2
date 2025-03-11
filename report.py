@@ -285,3 +285,99 @@ def analyze_commits(repo, author, since, until, commits_by_repo=None):
             status = file.get("status", "")
 
             file_type_stats[ext]["additions"] += additions
+            file_type_stats[ext]["deletions"] += deletions
+            file_type_stats[ext]["changes"] += changes
+            per_repo_stats[repo][ext]["additions"] += additions
+            per_repo_stats[repo][ext]["deletions"] += deletions
+            per_repo_stats[repo][ext]["changes"] += changes
+
+            if status == "modified":
+                file_type_stats[ext]["modifications"] += 1
+                per_repo_stats[repo][ext]["modifications"] += 1
+            elif status == "added":
+                file_type_stats[ext]["added"] += 1
+                per_repo_stats[repo][ext]["added"] += 1
+            elif status == "removed":
+                file_type_stats[ext]["removed"] += 1
+                per_repo_stats[repo][ext]["removed"] += 1
+            elif status == "renamed":
+                file_type_stats[ext]["renamed"] += 1
+                per_repo_stats[repo][ext]["renamed"] += 1
+
+    return file_type_stats, per_repo_stats
+
+def generate_report(devs, repos, since, until, per_repo=PER_REPO):
+    report = {}
+    for dev in devs:
+        report[dev] = {
+            "total": {"additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0},
+            "by_file_type": collections.defaultdict(lambda: {
+                "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+            })
+        }
+        if per_repo:
+            report[dev]["by_repo"] = collections.defaultdict(lambda: collections.defaultdict(lambda: {
+                "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
+            }))
+
+        commits_by_repo = get_commits_graphql(repos, dev, since, until)
+        for repo in repos:
+            file_stats, repo_stats = analyze_commits(repo, dev, since, until, commits_by_repo)
+            for ext, stats in file_stats.items():
+                for key in stats:
+                    report[dev]["by_file_type"][ext][key] += stats[key]
+                    report[dev]["total"][key] += stats[key]
+            if per_repo:
+                for repo_name, ext_stats in repo_stats.items():
+                    for ext, stats in ext_stats.items():
+                        for key in stats:
+                            report[dev]["by_repo"][repo_name][ext][key] += stats[key]
+    return report
+
+def print_cloc_style_report(report, per_repo=PER_REPO):
+    for dev, data in report.items():
+        print(f"\n{'='*100}")
+        print(f"Developer: {dev}")
+        print(f"{'='*100}")
+        print(f"{'Language':<20} {'Modifications':<15} {'Added':<10} {'Removed':<10} {'Renamed':<10} {'Line Adds':<10} {'Line Dels':<10} {'Line Changes':<15}")
+        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+        for ext, stats in data["by_file_type"].items():
+            lang = LANGUAGE_MAP.get(ext, ext)
+            print(f"{lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
+        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+        print(f"{'SUM':<20} {data['total']['modifications']:<15} {data['total']['added']:<10} {data['total']['removed']:<10} {data['total']['renamed']:<10} {data['total']['additions']:<10} {data['total']['deletions']:<10} {data['total']['changes']:<15}")
+        if per_repo:
+            print(f"\n{'-'*100}")
+            print(f"    By Repository:")
+            print(f"    {'-'*96}")
+            for repo, ext_stats in data["by_repo"].items():
+                print(f"\n    Repository: {repo}")
+                print(f"    {'Language':<20} {'Modifications':<15} {'Added':<10} {'Removed':<10} {'Renamed':<10} {'Line Adds':<10} {'Line Dels':<10} {'Line Changes':<15}")
+                print(f"    {'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+                for ext, stats in ext_stats.items():
+                    lang = LANGUAGE_MAP.get(ext, ext)
+                    print(f"    {lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
+
+if __name__ == "__main__":
+    print("Validating token...")
+    validate_token()
+    
+    since, until = get_time_range()
+    devs = load_file_lines(DEVS_FILE)
+    repos = get_org_repos(ORGANIZATION) if USE_ORG_REPOS else load_file_lines(REPOS_FILE)
+
+    print("Probing repositories...")
+    valid_repos = probe_repositories(repos)
+    if not valid_repos:
+        print("No valid repositories found. Exiting.")
+        exit(1)
+    print(f"Found {len(valid_repos)} valid repositories: {', '.join(valid_repos)}")
+
+    if DEBUG_MODE:
+        devs = [DEBUG_DEV] if DEBUG_DEV else devs
+        repos = [DEBUG_REPO] if DEBUG_REPO in valid_repos else valid_repos
+        print(f"Debug Mode: Testing {devs[0]} on {repos[0]}")
+
+    print(f"Generating report for {since} to {until} across branches {TARGET_BRANCHES}")
+    report = generate_report(devs, valid_repos, since, until)
+    print_cloc_style_report(report)
