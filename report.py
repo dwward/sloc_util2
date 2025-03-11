@@ -43,6 +43,7 @@ TARGET_BRANCHES = config.get('DEFAULT', 'branches', fallback='main').split(',')
 IGNORE_NO_EXTENSION = config.getboolean('DEFAULT', 'ignore_no_extension', fallback=False)
 SHOW_REPO_STATS = config.getboolean('DEFAULT', 'show_repo_states', fallback=False)
 PER_REPO = config.getboolean('DEFAULT', 'show_repo_stats', fallback=True)
+REPO_BATCH_SIZE = config.getint('DEFAULT', 'repo_batch_size', fallback=10)  # New config option
 
 # Debug settings
 DEBUG_MODE = config.getboolean('DEFAULT', 'debug_mode')
@@ -92,7 +93,7 @@ def probe_repositories(repos):
     for repo in repos:
         url = f"{GITHUB_URL}/repos/{repo}"
         try:
-            response = SESSION.head(url, verify=not DISABLE_SSL)
+            response = SESSION.head(url, verify=not DISABLE_SSL, timeout=(5.0, 30.0))
             response.raise_for_status()
             valid_repos.append(repo)
         except requests.exceptions.RequestException as e:
@@ -103,7 +104,7 @@ def get_org_repos(org):
     repos = []
     url = f"{GITHUB_URL}/orgs/{org}/repos?per_page=100"
     while url:
-        response = SESSION.get(url, verify=not DISABLE_SSL)
+        response = SESSION.get(url, verify=not DISABLE_SSL, timeout=(5.0, 30.0))
         response.raise_for_status()
         repos.extend([repo['full_name'] for repo in response.json()])
         url = response.links.get('next', {}).get('url')
@@ -134,85 +135,86 @@ def get_commits_graphql(repos, author, since, until):
         print(f"Cache hit for {author} across {len(repos)} repos")
         return COMMITS_CACHE[cache_key]
 
-    print(f"Fetching GraphQL data for {author} across {len(repos)} repos...")
+    print(f"Fetching GraphQL data for {author} across {len(repos)} repos in batches of {REPO_BATCH_SIZE}...")
     print(f"Querying branches: {TARGET_BRANCHES}, since: {since}, until: {until}")
     commits_by_repo = {}
     
-    for repo in repos[:5] if DEBUG_MODE else repos:  # Limit to 5 repos in debug mode
-        org, repo_name = repo.split('/')
-        after_cursor = None
-        repo_commits = []
+    # Process repos in batches
+    for batch_start in range(0, len(repos), REPO_BATCH_SIZE):
+        batch_repos = repos[batch_start:batch_start + REPO_BATCH_SIZE]
+        if DEBUG_MODE and batch_start >= 5:  # Limit to 5 repos total in debug mode
+            break
         
-        while True:
-            query = (
-                f'query($since: GitTimestamp!, $until: GitTimestamp!, $after: String) {{\n'
-                f'  repository(owner: "{org}", name: "{repo_name}") {{\n'
-                f'    refs(refPrefix: "refs/heads/", first: 50, after: $after) {{\n'  # Reduced to 50
-                f'      nodes {{\n'
-                f'        name\n'
-                f'        target {{\n'
-                f'          ... on Commit {{\n'
-                f'            history(first: 50, since: $since, until: $until) {{\n'  # Reduced to 50
-                f'              nodes {{\n'
-                f'                oid\n'
-                f'                additions\n'
-                f'                deletions\n'
-                f'                changedFilesIfAvailable\n'
-                f'                committedDate\n'
-                f'                author {{\n'
-                f'                  name\n'
-                f'                  email\n'
-                f'                  user {{\n'
-                f'                    login\n'
-                f'                  }}\n'
+        query_parts = []
+        for i, repo in enumerate(batch_repos):
+            org, repo_name = repo.split('/')
+            query_parts.append(
+                f'repo{i}: repository(owner: "{org}", name: "{repo_name}") {{\n'
+                f'  refs(refPrefix: "refs/heads/", first: 50) {{\n'
+                f'    nodes {{\n'
+                f'      name\n'
+                f'      target {{\n'
+                f'        ... on Commit {{\n'
+                f'          history(first: 50, since: $since, until: $until) {{\n'
+                f'            nodes {{\n'
+                f'              oid\n'
+                f'              additions\n'
+                f'              deletions\n'
+                f'              changedFilesIfAvailable\n'
+                f'              committedDate\n'
+                f'              author {{\n'
+                f'                name\n'
+                f'                email\n'
+                f'                user {{\n'
+                f'                  login\n'
                 f'                }}\n'
                 f'              }}\n'
-                f'              pageInfo {{\n'
-                f'                endCursor\n'
-                f'                hasNextPage\n'
-                f'              }}\n'
+                f'            }}\n'
+                f'            pageInfo {{\n'
+                f'              endCursor\n'
+                f'              hasNextPage\n'
                 f'            }}\n'
                 f'          }}\n'
                 f'        }}\n'
-                f'      }}\n'
-                f'      pageInfo {{\n'
-                f'        endCursor\n'
-                f'        hasNextPage\n'
                 f'      }}\n'
                 f'    }}\n'
                 f'  }}\n'
                 f'}}'
             )
-            variables = {"since": since, "until": until, "after": after_cursor}
+        query = f"query($since: GitTimestamp!, $until: GitTimestamp!) {{\n" + "\n".join(query_parts) + "\n}}"
+        variables = {"since": since, "until": until}
 
-            response = None
-            try:
-                response = SESSION.post(GRAPHQL_URL, json={"query": query, "variables": variables}, verify=not DISABLE_SSL, timeout=(5.0, 30.0))
-                response.raise_for_status()
-            except requests.exceptions.HTTPError as e:
-                print(f"GraphQL request failed for {repo}: {e}")
-                if response:
-                    print(f"Status Code: {response.status_code}")
-                    print(f"Response Headers: {response.headers}")
-                    print(f"Response Text: {response.text}")
-                else:
-                    print("No response received due to HTTP error")
-                break
-            except requests.exceptions.Timeout as e:
-                print(f"Timeout error for {repo}: {e}")
-                break
-            except requests.exceptions.RequestException as e:
-                print(f"Network error for {repo}: {e}")
-                break
+        response = None
+        try:
+            response = SESSION.post(GRAPHQL_URL, json={"query": query, "variables": variables}, verify=not DISABLE_SSL, timeout=(5.0, 30.0))
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            print(f"GraphQL request failed for batch {batch_start}-{batch_start+len(batch_repos)-1}: {e}")
+            if response:
+                print(f"Status Code: {response.status_code}")
+                print(f"Response Headers: {response.headers}")
+                print(f"Response Text: {response.text}")
+            else:
+                print("No response received due to HTTP error")
+            continue
+        except requests.exceptions.Timeout as e:
+            print(f"Timeout error for batch {batch_start}-{batch_start+len(batch_repos)-1}: {e}")
+            continue
+        except requests.exceptions.RequestException as e:
+            print(f"Network error for batch {batch_start}-{batch_start+len(batch_repos)-1}: {e}")
+            continue
 
-            if not response:
-                break
+        if not response:
+            continue
 
-            data = response.json()
-            if DEBUG_MODE:
-                print(f"GraphQL Response for {repo}: {json.dumps(data, indent=2)}")
+        data = response.json()
+        if DEBUG_MODE:
+            print(f"GraphQL Response for batch {batch_start}-{batch_start+len(batch_repos)-1}: {json.dumps(data, indent=2)}")
 
-            repo_data = data.get("data", {}).get("repository", {})
+        for i, repo in enumerate(batch_repos):
+            repo_key = f"repo{i}"
+            repo_data = data.get("data", {}).get(repo_key, {})
+            commits_by_repo[repo] = []
             refs = repo_data.get("refs", {}).get("nodes", [])
             if not refs and DEBUG_MODE:
                 print(f"No branches found in {repo}")
@@ -244,14 +246,7 @@ def get_commits_graphql(repos, author, since, until):
                             },
                             "files": []
                         }
-                        repo_commits.append(commit_data)
-
-            page_info = repo_data.get("refs", {}).get("pageInfo", {})
-            if not page_info.get("hasNextPage", False):
-                break
-            after_cursor = page_info.get("endCursor")
-
-        commits_by_repo[repo] = repo_commits
+                        commits_by_repo[repo].append(commit_data)
 
     COMMITS_CACHE[cache_key] = commits_by_repo
     total_commits = sum(len(commits) for commits in commits_by_repo.values())
@@ -290,99 +285,3 @@ def analyze_commits(repo, author, since, until, commits_by_repo=None):
             status = file.get("status", "")
 
             file_type_stats[ext]["additions"] += additions
-            file_type_stats[ext]["deletions"] += deletions
-            file_type_stats[ext]["changes"] += changes
-            per_repo_stats[repo][ext]["additions"] += additions
-            per_repo_stats[repo][ext]["deletions"] += deletions
-            per_repo_stats[repo][ext]["changes"] += changes
-
-            if status == "modified":
-                file_type_stats[ext]["modifications"] += 1
-                per_repo_stats[repo][ext]["modifications"] += 1
-            elif status == "added":
-                file_type_stats[ext]["added"] += 1
-                per_repo_stats[repo][ext]["added"] += 1
-            elif status == "removed":
-                file_type_stats[ext]["removed"] += 1
-                per_repo_stats[repo][ext]["removed"] += 1
-            elif status == "renamed":
-                file_type_stats[ext]["renamed"] += 1
-                per_repo_stats[repo][ext]["renamed"] += 1
-
-    return file_type_stats, per_repo_stats
-
-def generate_report(devs, repos, since, until, per_repo=PER_REPO):
-    report = {}
-    for dev in devs:
-        report[dev] = {
-            "total": {"additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0},
-            "by_file_type": collections.defaultdict(lambda: {
-                "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
-            })
-        }
-        if per_repo:
-            report[dev]["by_repo"] = collections.defaultdict(lambda: collections.defaultdict(lambda: {
-                "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
-            }))
-
-        commits_by_repo = get_commits_graphql(repos, dev, since, until)
-        for repo in repos:
-            file_stats, repo_stats = analyze_commits(repo, dev, since, until, commits_by_repo)
-            for ext, stats in file_stats.items():
-                for key in stats:
-                    report[dev]["by_file_type"][ext][key] += stats[key]
-                    report[dev]["total"][key] += stats[key]
-            if per_repo:
-                for repo_name, ext_stats in repo_stats.items():
-                    for ext, stats in ext_stats.items():
-                        for key in stats:
-                            report[dev]["by_repo"][repo_name][ext][key] += stats[key]
-    return report
-
-def print_cloc_style_report(report, per_repo=PER_REPO):
-    for dev, data in report.items():
-        print(f"\n{'='*100}")
-        print(f"Developer: {dev}")
-        print(f"{'='*100}")
-        print(f"{'Language':<20} {'Modifications':<15} {'Added':<10} {'Removed':<10} {'Renamed':<10} {'Line Adds':<10} {'Line Dels':<10} {'Line Changes':<15}")
-        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
-        for ext, stats in data["by_file_type"].items():
-            lang = LANGUAGE_MAP.get(ext, ext)
-            print(f"{lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
-        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
-        print(f"{'SUM':<20} {data['total']['modifications']:<15} {data['total']['added']:<10} {data['total']['removed']:<10} {data['total']['renamed']:<10} {data['total']['additions']:<10} {data['total']['deletions']:<10} {data['total']['changes']:<15}")
-        if per_repo:
-            print(f"\n{'-'*100}")
-            print(f"    By Repository:")
-            print(f"    {'-'*96}")
-            for repo, ext_stats in data["by_repo"].items():
-                print(f"\n    Repository: {repo}")
-                print(f"    {'Language':<20} {'Modifications':<15} {'Added':<10} {'Removed':<10} {'Renamed':<10} {'Line Adds':<10} {'Line Dels':<10} {'Line Changes':<15}")
-                print(f"    {'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
-                for ext, stats in ext_stats.items():
-                    lang = LANGUAGE_MAP.get(ext, ext)
-                    print(f"    {lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
-
-if __name__ == "__main__":
-    print("Validating token...")
-    validate_token()
-    
-    since, until = get_time_range()
-    devs = load_file_lines(DEVS_FILE)
-    repos = get_org_repos(ORGANIZATION) if USE_ORG_REPOS else load_file_lines(REPOS_FILE)
-
-    print("Probing repositories...")
-    valid_repos = probe_repositories(repos)
-    if not valid_repos:
-        print("No valid repositories found. Exiting.")
-        exit(1)
-    print(f"Found {len(valid_repos)} valid repositories: {', '.join(valid_repos)}")
-
-    if DEBUG_MODE:
-        devs = [DEBUG_DEV] if DEBUG_DEV else devs
-        repos = [DEBUG_REPO] if DEBUG_REPO in valid_repos else valid_repos
-        print(f"Debug Mode: Testing {devs[0]} on {repos[0]}")
-
-    print(f"Generating report for {since} to {until} across branches {TARGET_BRANCHES}")
-    report = generate_report(devs, valid_repos, since, until)
-    print_cloc_style_report(report)
