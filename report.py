@@ -43,7 +43,7 @@ TARGET_BRANCHES = config.get('DEFAULT', 'branches', fallback='main').split(',')
 IGNORE_NO_EXTENSION = config.getboolean('DEFAULT', 'ignore_no_extension', fallback=False)
 SHOW_REPO_STATS = config.getboolean('DEFAULT', 'show_repo_states', fallback=False)
 PER_REPO = config.getboolean('DEFAULT', 'show_repo_stats', fallback=True)
-REPO_BATCH_SIZE = config.getint('DEFAULT', 'repo_batch_size', fallback=10)  # New config option
+REPO_BATCH_SIZE = config.getint('DEFAULT', 'repo_batch_size', fallback=10)
 
 # Debug settings
 DEBUG_MODE = config.getboolean('DEFAULT', 'debug_mode')
@@ -139,7 +139,6 @@ def get_commits_graphql(repos, author, since, until):
     print(f"Querying branches: {TARGET_BRANCHES}, since: {since}, until: {until}")
     commits_by_repo = {}
     
-    # Process repos in batches
     for batch_start in range(0, len(repos), REPO_BATCH_SIZE):
         batch_repos = repos[batch_start:batch_start + REPO_BATCH_SIZE]
         if DEBUG_MODE and batch_start >= 5:  # Limit to 5 repos total in debug mode
@@ -194,8 +193,6 @@ def get_commits_graphql(repos, author, since, until):
                 print(f"Status Code: {response.status_code}")
                 print(f"Response Headers: {response.headers}")
                 print(f"Response Text: {response.text}")
-            else:
-                print("No response received due to HTTP error")
             continue
         except requests.exceptions.Timeout as e:
             print(f"Timeout error for batch {batch_start}-{batch_start+len(batch_repos)-1}: {e}")
@@ -227,6 +224,10 @@ def get_commits_graphql(repos, author, since, until):
                 if not history and DEBUG_MODE:
                     print(f"No commits found in {repo} on branch {branch_name} between {since} and {until}")
                 for commit in history:
+                    if commit is None:  # Check for null commit
+                        if DEBUG_MODE:
+                            print(f"Skipping null commit in {repo} on branch {branch_name}")
+                        continue
                     commit_login = commit.get("author", {}).get("user", {}).get("login", "")
                     commit_email_raw = commit.get("author", {}).get("email", "")
                     commit_name = commit.get("author", {}).get("name", "")
@@ -234,9 +235,8 @@ def get_commits_graphql(repos, author, since, until):
                     commit_email = commit_email_match.group(1) if commit_email_match else commit_email_raw
                     if DEBUG_MODE:
                         print(f"Commit in {repo}: login={commit_login or 'None'}, email_raw={commit_email_raw or 'None'}, email={commit_email or 'None'}, name={commit_name or 'None'}")
-                    if (commit_login.lower() == author.lower() or 
-                        (commit_email and commit_email.lower() == author.lower()) or 
-                        (commit_email and commit_email.split('@')[0].lower() == author.lower())):
+                    # Match only on email since it's stable
+                    if commit_email and commit_email.lower() == author.lower():
                         commit_data = {
                             "sha": commit["oid"],
                             "stats": {
