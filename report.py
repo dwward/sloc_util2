@@ -129,7 +129,6 @@ def validate_token():
         raise
 
 def get_commits_graphql(repos, author, since, until):
-    """Fetch commits for an author across multiple repositories using GraphQL with branch filtering."""
     cache_key = (tuple(repos), author, since, until)
     if cache_key in COMMITS_CACHE:
         print(f"Cache hit for {author} across {len(repos)} repos")
@@ -141,7 +140,7 @@ def get_commits_graphql(repos, author, since, until):
     
     for batch_start in range(0, len(repos), REPO_BATCH_SIZE):
         batch_repos = repos[batch_start:batch_start + REPO_BATCH_SIZE]
-        if DEBUG_MODE and batch_start >= 5:  # Limit to 5 repos total in debug mode
+        if DEBUG_MODE and batch_start >= 5:
             break
         
         query_parts = []
@@ -160,20 +159,9 @@ def get_commits_graphql(repos, author, since, until):
                 f'              oid\n'
                 f'              additions\n'
                 f'              deletions\n'
-                f'              changedFilesIfAvailable\n'
-                f'              committedDate\n'
-                f'              author {{\n'
-                f'                name\n'
-                f'                email\n'
-                f'                user {{\n'
-                f'                  login\n'
-                f'                }}\n'
-                f'              }}\n'
+                f'              author {{ email }}\n'
                 f'            }}\n'
-                f'            pageInfo {{\n'
-                f'              endCursor\n'
-                f'              hasNextPage\n'
-                f'            }}\n'
+                f'            pageInfo {{ endCursor, hasNextPage }}\n'
                 f'          }}\n'
                 f'        }}\n'
                 f'      }}\n'
@@ -188,18 +176,11 @@ def get_commits_graphql(repos, author, since, until):
         try:
             response = SESSION.post(GRAPHQL_URL, json={"query": query, "variables": variables}, verify=not DISABLE_SSL, timeout=(5.0, 30.0))
             response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
+        except requests.exceptions.RequestException as e:
             print(f"GraphQL request failed for batch {batch_start}-{batch_start+len(batch_repos)-1}: {e}")
             if response:
                 print(f"Status Code: {response.status_code}")
-                print(f"Response Headers: {response.headers}")
                 print(f"Response Text: {response.text}")
-            continue
-        except requests.exceptions.Timeout as e:
-            print(f"Timeout error for batch {batch_start}-{batch_start+len(batch_repos)-1}: {e}")
-            continue
-        except requests.exceptions.RequestException as e:
-            print(f"Network error for batch {batch_start}-{batch_start+len(batch_repos)-1}: {e}")
             continue
 
         if not response:
@@ -213,29 +194,36 @@ def get_commits_graphql(repos, author, since, until):
             repo_key = f"repo{i}"
             repo_data = data.get("data", {}).get(repo_key, {})
             commits_by_repo[repo] = []
-            refs = repo_data.get("refs", {}).get("nodes", [])
+            refs = repo_data.get("refs", {}).get("nodes", []) or []
             if not refs and DEBUG_MODE:
                 print(f"No branches found in {repo} matching {TARGET_BRANCHES}")
 
             for ref in refs:
+                if not isinstance(ref, dict):
+                    if DEBUG_MODE:
+                        print(f"Skipping invalid ref in {repo}: {ref}")
+                    continue
                 branch_name = ref.get("name", "unknown")
                 if DEBUG_MODE:
                     print(f"Found branch in {repo}: {branch_name}")
-                history = ref.get("target", {}).get("history", {}).get("nodes", [])
+                target = ref.get("target", {})
+                if not isinstance(target, dict):
+                    if DEBUG_MODE:
+                        print(f"Skipping invalid target in {repo} on branch {branch_name}: {target}")
+                    continue
+                history = target.get("history", {}).get("nodes", []) or []
                 if not history and DEBUG_MODE:
                     print(f"No commits found in {repo} on branch {branch_name} between {since} and {until}")
-                for commit in history or []:  # Handle null history
-                    if not isinstance(commit, dict):  # Check if commit is a valid dict
+                for commit in history:
+                    if not isinstance(commit, dict):
                         if DEBUG_MODE:
                             print(f"Skipping invalid commit in {repo} on branch {branch_name}: {commit}")
                         continue
-                    commit_login = commit.get("author", {}).get("user", {}).get("login", "")
                     commit_email_raw = commit.get("author", {}).get("email", "")
-                    commit_name = commit.get("author", {}).get("name", "")
                     commit_email_match = re.search(r'<(.+?)>', commit_email_raw) if commit_email_raw else None
                     commit_email = commit_email_match.group(1) if commit_email_match else commit_email_raw
                     if DEBUG_MODE:
-                        print(f"Commit in {repo}: login={commit_login or 'None'}, email_raw={commit_email_raw or 'None'}, email={commit_email or 'None'}, name={commit_name or 'None'}")
+                        print(f"Commit in {repo}: email_raw={commit_email_raw or 'None'}, email={commit_email or 'None'}")
                     if commit_email and commit_email.lower() == author.lower():
                         commit_data = {
                             "sha": commit.get("oid", ""),
@@ -252,7 +240,6 @@ def get_commits_graphql(repos, author, since, until):
     total_commits = sum(len(commits) for commits in commits_by_repo.values())
     print(f"Fetched {total_commits} unique commits for {author} across {len(repos)} repositories")
     return commits_by_repo
-
 def get_commit_details(repo, sha):
     url = f"{GITHUB_URL}/repos/{repo}/commits/{sha}"
     response = SESSION.get(url, verify=not DISABLE_SSL, timeout=(5.0, 30.0))
