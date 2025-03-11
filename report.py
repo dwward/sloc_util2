@@ -6,29 +6,28 @@ import os
 import collections
 import argparse
 import urllib3
+import json
 
-# Parse Access Token from either an environment variable or a parameter
+# Parse Access Token
 TOKEN = os.environ.get("GITHUB_PAT")
-
 if not TOKEN:
     parser = argparse.ArgumentParser(description="GitHub Enterprise Commit Report Generator")
     parser.add_argument("--token", required=False, help="GitHub Personal Access Token")
     args = parser.parse_args()
-    TOKEN = args.token  # Use token from command-line argument
-
+    TOKEN = args.token
 if not TOKEN:
-    raise ValueError("Personal Access Token is not set. Set GITHUB_PAT as environment variable, or pass as parameter using '--token <token>' ")
+    raise ValueError("Personal Access Token is not set. Set GITHUB_PAT or use '--token <token>'")
 
-# Load configuration (excluding token)
+# Load configuration
 config = configparser.ConfigParser(allow_no_value=True, inline_comment_prefixes=('#', ';'))
 config.read('config.properties')
 
 # Suppress SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # TODO: put this in an error log
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # GitHub API setup
 GITHUB_URL = config.get('DEFAULT', 'github_url')
-GRAPHQL_URL = GITHUB_URL.replace('/api/v3', '/api/graphql')  # Adjust for GitHub Enterprise
+GRAPHQL_URL = GITHUB_URL.replace('/api/v3', '/api/graphql')
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"}
 
 # Report settings
@@ -58,19 +57,17 @@ LANGUAGE_MAP = {
     "sh": "Shell", "no_extension": "Unknown"
 }
 
-# Global session for connection reuse
+# Global session
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
-# In-memory cache for GraphQL results
+# In-memory cache
 COMMITS_CACHE = {}
 
-# Loads lines from devs/repos file and ignore comments
 def load_file_lines(file_path):
     with open(file_path, 'r') as f:
         return [line.strip() for line in f if line.strip() and not line.strip().startswith(('#', ';'))]
 
-# Parse date ranges for the query from properties
 def get_time_range():
     if TIME_RANGE:
         try:
@@ -81,7 +78,7 @@ def get_time_range():
             until = f"{end}T23:59:59Z"
             return since, until
         except ValueError as e:
-            raise ValueError(f"Invalid time_range format in config.properties. Use YYYY-MM-DD:YYYY-MM-DD. Error: {e}")
+            raise ValueError(f"Invalid time_range format: {e}")
     else:
         end = datetime.now()
         start = end - relativedelta(months=LAST_X_MONTHS)
@@ -117,71 +114,65 @@ def get_commits_graphql(repos, author, since, until):
     if cache_key in COMMITS_CACHE:
         return COMMITS_CACHE[cache_key]
 
-    # GraphQL query to fetch commits and file changes
-    query = """
-    query($repoNames: [String!]!, $author: String!, $since: GitTimestamp!, $until: GitTimestamp!) {
-      search(query: "is:repo", type: REPOSITORY, first: 100) {
-        nodes {
-          ... on Repository {
-            nameWithOwner
-            refs(refPrefix: "refs/heads/", first: %d, query: "%s") {
-              nodes {
-                target {
-                  ... on Commit {
-                    history(first: 100, author: {login: $author}, since: $since, until: $until) {
-                      nodes {
-                        oid
-                        additions
-                        deletions
-                        changedFilesIfAvailable
-                        committedDate
-                        associatedPullRequests(first: 1) {
-                          nodes {
-                            files(first: 100) {
-                              nodes {
-                                path
-                                additions
-                                deletions
-                                changeType
-                              }
-                            }
-                          }
-                        }
-                      }
-                      pageInfo { endCursor, hasNextPage }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    """ % (len(TARGET_BRANCHES), " ".join(TARGET_BRANCHES))
-
-    variables = {
-        "repoNames": repos,
-        "author": author,
-        "since": since,
-        "until": until
-    }
+    # Construct GraphQL query for specific repositories
+    query_parts = []
+    variables = {"author": author, "since": since, "until": until}
+    for i, repo in enumerate(repos):
+        org, repo_name = repo.split('/')
+        query_parts.append(f"""
+        repo{i}: repository(owner: "{org}", name: "{repo_name}") {{
+          refs(refPrefix: "refs/heads/", first: {len(TARGET_BRANCHES)}, query: "{" ".join(TARGET_BRANCHES)}") {{
+            nodes {{
+              target {{
+                ... on Commit {{
+                  history(first: 100, author: {{login: $author}}, since: $since, until: $until) {{
+                    nodes {{
+                      oid
+                      additions
+                      deletions
+                      changedFilesIfAvailable
+                      committedDate
+                      committedFiles: tree {{
+                        entries {{
+                          path
+                          object {{
+                            ... on Blob {{ byteSize }}
+                          }}
+                        }}
+                      }}
+                    }}
+                    pageInfo {{ endCursor, hasNextPage }}
+                  }}
+                }}
+              }}
+            }}
+          }}
+        }}
+        """)
+    query = "query($author: String!, $since: GitTimestamp!, $until: GitTimestamp!) { " + " ".join(query_parts) + " }"
 
     response = SESSION.post(GRAPHQL_URL, json={"query": query, "variables": variables}, verify=not DISABLE_SSL, timeout=(0.5, 10.0))
-    response.raise_for_status()
-    data = response.json()
+    try:
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"GraphQL request failed: {e}")
+        print(f"Response: {response.text}")
+        return {}
 
-    # Process GraphQL response into a repo-to-commits mapping
+    data = response.json()
+    if DEBUG_MODE:
+        print(f"GraphQL Response for {author}: {json.dumps(data, indent=2)}")
+
+    # Process GraphQL response
     commits_by_repo = {}
-    for repo_node in data.get("data", {}).get("search", {}).get("nodes", []):
-        repo_name = repo_node.get("nameWithOwner")
-        if repo_name not in repos:
-            continue
-        commits_by_repo[repo_name] = []
-        for ref in repo_node.get("refs", {}).get("nodes", []):
+    for i, repo in enumerate(repos):
+        repo_key = f"repo{i}"
+        repo_data = data.get("data", {}).get(repo_key, {})
+        commits_by_repo[repo] = []
+        for ref in repo_data.get("refs", {}).get("nodes", []):
             history = ref.get("target", {}).get("history", {}).get("nodes", [])
             for commit in history:
-                files = commit.get("associatedPullRequests", {}).get("nodes", [{}])[0].get("files", {}).get("nodes", [])
+                files = commit.get("committedFiles", {}).get("entries", [])
                 commit_data = {
                     "sha": commit["oid"],
                     "stats": {
@@ -192,14 +183,14 @@ def get_commits_graphql(repos, author, since, until):
                     "files": [
                         {
                             "filename": f["path"],
-                            "additions": f.get("additions", 0),
-                            "deletions": f.get("deletions", 0),
-                            "changes": f.get("additions", 0) + f.get("deletions", 0),
-                            "status": f.get("changeType", "").lower()  # Convert to match REST API
+                            "additions": f.get("additions", 0),  # Approximate if not available
+                            "deletions": f.get("deletions", 0),  # Approximate if not available
+                            "changes": f.get("byteSize", 0) if f.get("object") else 0,  # Use byteSize as proxy
+                            "status": "modified"  # Default; GraphQL lacks direct status
                         } for f in files
                     ]
                 }
-                commits_by_repo[repo_name].append(commit_data)
+                commits_by_repo[repo].append(commit_data)
 
     COMMITS_CACHE[cache_key] = commits_by_repo
     if DEBUG_MODE:
@@ -208,7 +199,6 @@ def get_commits_graphql(repos, author, since, until):
     return commits_by_repo
 
 def analyze_commits(repo, author, since, until, commits_by_repo=None):
-    """Analyze commits using pre-fetched GraphQL data."""
     if commits_by_repo is None:
         commits_by_repo = get_commits_graphql([repo], author, since, until)
     
@@ -268,7 +258,6 @@ def generate_report(devs, repos, since, until, per_repo=PER_REPO):
                 "additions": 0, "deletions": 0, "changes": 0, "modifications": 0, "added": 0, "removed": 0, "renamed": 0
             }))
 
-        # Fetch all commits for this dev across all repos in one GraphQL call
         commits_by_repo = get_commits_graphql(repos, dev, since, until)
         for repo in repos:
             file_stats, repo_stats = analyze_commits(repo, dev, since, until, commits_by_repo)
@@ -315,7 +304,7 @@ if __name__ == "__main__":
     print("Probing repositories...")
     valid_repos = probe_repositories(repos)
     if not valid_repos:
-        print("No valid repositories found. Exiting.")  # TODO: error log
+        print("No valid repositories found. Exiting.")
         exit(1)
     print(f"Found {len(valid_repos)} valid repositories: {', '.join(valid_repos)}")
 
