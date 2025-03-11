@@ -169,13 +169,14 @@ def get_commits_graphql(repos, author, since, until):
         commits_by_repo[repo] = []
         for ref in repo_data.get("refs", {}).get("nodes", []):
             history = ref.get("target", {}).get("history", {}).get("nodes", [])
+            if not history and DEBUG_MODE:
+                print(f"No commits found in {repo} for branches {TARGET_BRANCHES} between {since} and {until}")
             for commit in history:
                 commit_login = commit.get("author", {}).get("user", {}).get("login", "")
                 commit_email = commit.get("author", {}).get("email", "")
                 commit_name = commit.get("author", {}).get("name", "")
                 if DEBUG_MODE:
-                    print(f"Commit in {repo}: login={commit_login}, email={commit_email}, name={commit_name}")
-                # Match author by login, email, or email username
+                    print(f"Commit in {repo}: login={commit_login or 'None'}, email={commit_email or 'None'}, name={commit_name or 'None'}")
                 if (commit_login == author or 
                     commit_email == author or 
                     (commit_email and commit_email.split('@')[0] == author)):
@@ -264,4 +265,59 @@ def generate_report(devs, repos, since, until, per_repo=PER_REPO):
 
         commits_by_repo = get_commits_graphql(repos, dev, since, until)
         for repo in repos:
-            file_stats, repo_stats = analyze...
+            file_stats, repo_stats = analyze_commits(repo, dev, since, until, commits_by_repo)
+            for ext, stats in file_stats.items():
+                for key in stats:
+                    report[dev]["by_file_type"][ext][key] += stats[key]
+                    report[dev]["total"][key] += stats[key]
+            if per_repo:
+                for repo_name, ext_stats in repo_stats.items():
+                    for ext, stats in ext_stats.items():
+                        for key in stats:
+                            report[dev]["by_repo"][repo_name][ext][key] += stats[key]
+    return report
+
+def print_cloc_style_report(report, per_repo=PER_REPO):
+    for dev, data in report.items():
+        print(f"\n{'='*100}")
+        print(f"Developer: {dev}")
+        print(f"{'='*100}")
+        print(f"{'Language':<20} {'Modifications':<15} {'Added':<10} {'Removed':<10} {'Renamed':<10} {'Line Adds':<10} {'Line Dels':<10} {'Line Changes':<15}")
+        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+        for ext, stats in data["by_file_type"].items():
+            lang = LANGUAGE_MAP.get(ext, ext)
+            print(f"{lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
+        print(f"{'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+        print(f"{'SUM':<20} {data['total']['modifications']:<15} {data['total']['added']:<10} {data['total']['removed']:<10} {data['total']['renamed']:<10} {data['total']['additions']:<10} {data['total']['deletions']:<10} {data['total']['changes']:<15}")
+        if per_repo:
+            print(f"\n{'-'*100}")
+            print(f"    By Repository:")
+            print(f"    {'-'*96}")
+            for repo, ext_stats in data["by_repo"].items():
+                print(f"\n    Repository: {repo}")
+                print(f"    {'Language':<20} {'Modifications':<15} {'Added':<10} {'Removed':<10} {'Renamed':<10} {'Line Adds':<10} {'Line Dels':<10} {'Line Changes':<15}")
+                print(f"    {'-'*20} {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+                for ext, stats in ext_stats.items():
+                    lang = LANGUAGE_MAP.get(ext, ext)
+                    print(f"    {lang:<20} {stats['modifications']:<15} {stats['added']:<10} {stats['removed']:<10} {stats['renamed']:<10} {stats['additions']:<10} {stats['deletions']:<10} {stats['changes']:<15}")
+
+if __name__ == "__main__":
+    since, until = get_time_range()
+    devs = load_file_lines(DEVS_FILE)
+    repos = get_org_repos(ORGANIZATION) if USE_ORG_REPOS else load_file_lines(REPOS_FILE)
+
+    print("Probing repositories...")
+    valid_repos = probe_repositories(repos)
+    if not valid_repos:
+        print("No valid repositories found. Exiting.")
+        exit(1)
+    print(f"Found {len(valid_repos)} valid repositories: {', '.join(valid_repos)}")
+
+    if DEBUG_MODE:
+        devs = [DEBUG_DEV]
+        repos = [DEBUG_REPO]
+        print(f"Debug Mode: Testing {DEBUG_DEV} on {DEBUG_REPO}")
+
+    print(f"Generating report for {since} to {until} across branches {TARGET_BRANCHES}")
+    report = generate_report(devs, valid_repos, since, until)
+    print_cloc_style_report(report)
