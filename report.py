@@ -129,7 +129,7 @@ def validate_token():
         raise
 
 def get_commits_graphql(repos, author, since, until):
-    """Fetch commits for an author across multiple repositories using GraphQL with pagination."""
+    """Fetch commits for an author across multiple repositories using GraphQL with branch filtering."""
     cache_key = (tuple(repos), author, since, until)
     if cache_key in COMMITS_CACHE:
         print(f"Cache hit for {author} across {len(repos)} repos")
@@ -147,9 +147,10 @@ def get_commits_graphql(repos, author, since, until):
         query_parts = []
         for i, repo in enumerate(batch_repos):
             org, repo_name = repo.split('/')
+            branch_query = " ".join(TARGET_BRANCHES)  # Combine target branches into a space-separated string
             query_parts.append(
                 f'repo{i}: repository(owner: "{org}", name: "{repo_name}") {{\n'
-                f'  refs(refPrefix: "refs/heads/", first: 50) {{\n'
+                f'  refs(refPrefix: "refs/heads/", first: {len(TARGET_BRANCHES)}, query: "{branch_query}") {{\n'  # Filter branches
                 f'    nodes {{\n'
                 f'      name\n'
                 f'      target {{\n'
@@ -214,7 +215,7 @@ def get_commits_graphql(repos, author, since, until):
             commits_by_repo[repo] = []
             refs = repo_data.get("refs", {}).get("nodes", [])
             if not refs and DEBUG_MODE:
-                print(f"No branches found in {repo}")
+                print(f"No branches found in {repo} matching {TARGET_BRANCHES}")
 
             for ref in refs:
                 branch_name = ref.get("name", "unknown")
@@ -224,7 +225,7 @@ def get_commits_graphql(repos, author, since, until):
                 if not history and DEBUG_MODE:
                     print(f"No commits found in {repo} on branch {branch_name} between {since} and {until}")
                 for commit in history:
-                    if commit is None:  # Check for null commit
+                    if commit is None:
                         if DEBUG_MODE:
                             print(f"Skipping null commit in {repo} on branch {branch_name}")
                         continue
@@ -235,7 +236,6 @@ def get_commits_graphql(repos, author, since, until):
                     commit_email = commit_email_match.group(1) if commit_email_match else commit_email_raw
                     if DEBUG_MODE:
                         print(f"Commit in {repo}: login={commit_login or 'None'}, email_raw={commit_email_raw or 'None'}, email={commit_email or 'None'}, name={commit_name or 'None'}")
-                    # Match only on email since it's stable
                     if commit_email and commit_email.lower() == author.lower():
                         commit_data = {
                             "sha": commit["oid"],
@@ -364,7 +364,7 @@ if __name__ == "__main__":
     
     since, until = get_time_range()
     devs = load_file_lines(DEVS_FILE)
-    repos = get_org_repos(ORGANIZATION) if USE_ORG_REPOS else load_file_lines(REPOS_FILE)
+    repos = get_org_repos(ORGANIZATION) if USE_ORG_RECouldn'tPOS else load_file_lines(REPOS_FILE)
 
     print("Probing repositories...")
     valid_repos = probe_repositories(repos)
