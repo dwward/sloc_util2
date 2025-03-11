@@ -7,6 +7,7 @@ import collections
 import argparse
 import urllib3
 import json
+import re  # Added for email extraction
 
 # Parse Access Token
 TOKEN = os.environ.get("GITHUB_PAT")
@@ -116,14 +117,16 @@ def get_commits_graphql(repos, author, since, until):
         return COMMITS_CACHE[cache_key]
 
     print(f"Fetching GraphQL data for {author} across {len(repos)} repos...")
+    print(f"Querying branches: {TARGET_BRANCHES}, since: {since}, until: {until}")
     query_parts = []
     variables = {"since": since, "until": until}
     for i, repo in enumerate(repos):
         org, repo_name = repo.split('/')
         query_parts.append(
             f'repo{i}: repository(owner: "{org}", name: "{repo_name}") {{\n'
-            f'  refs(refPrefix: "refs/heads/", first: {len(TARGET_BRANCHES)}, query: "{" ".join(TARGET_BRANCHES)}") {{\n'
+            f'  refs(refPrefix: "refs/heads/", first: 100) {{\n'
             f'    nodes {{\n'
+            f'      name\n'
             f'      target {{\n'
             f'        ... on Commit {{\n'
             f'          history(first: 100, since: $since, until: $until) {{\n'
@@ -167,19 +170,29 @@ def get_commits_graphql(repos, author, since, until):
         repo_key = f"repo{i}"
         repo_data = data.get("data", {}).get(repo_key, {})
         commits_by_repo[repo] = []
-        for ref in repo_data.get("refs", {}).get("nodes", []):
+        refs = repo_data.get("refs", {}).get("nodes", [])
+        if not refs and DEBUG_MODE:
+            print(f"No branches found in {repo}")
+        for ref in refs:
+            branch_name = ref.get("name", "unknown")
+            if DEBUG_MODE:
+                print(f"Found branch in {repo}: {branch_name}")
             history = ref.get("target", {}).get("history", {}).get("nodes", [])
             if not history and DEBUG_MODE:
-                print(f"No commits found in {repo} for branches {TARGET_BRANCHES} between {since} and {until}")
+                print(f"No commits found in {repo} on branch {branch_name} between {since} and {until}")
             for commit in history:
                 commit_login = commit.get("author", {}).get("user", {}).get("login", "")
-                commit_email = commit.get("author", {}).get("email", "")
+                commit_email_raw = commit.get("author", {}).get("email", "")
                 commit_name = commit.get("author", {}).get("name", "")
+                # Extract email from "Full Name <email@example.com>" format
+                commit_email_match = re.search(r'<(.+?)>', commit_email_raw) if commit_email_raw else None
+                commit_email = commit_email_match.group(1) if commit_email_match else commit_email_raw
                 if DEBUG_MODE:
-                    print(f"Commit in {repo}: login={commit_login or 'None'}, email={commit_email or 'None'}, name={commit_name or 'None'}")
-                if (commit_login == author or 
-                    commit_email == author or 
-                    (commit_email and commit_email.split('@')[0] == author)):
+                    print(f"Commit in {repo}: login={commit_login or 'None'}, email_raw={commit_email_raw or 'None'}, email={commit_email or 'None'}, name={commit_name or 'None'}")
+                # Case-insensitive match
+                if (commit_login.lower() == author.lower() or 
+                    (commit_email and commit_email.lower() == author.lower()) or 
+                    (commit_email and commit_email.split('@')[0].lower() == author.lower())):
                     commit_data = {
                         "sha": commit["oid"],
                         "stats": {
@@ -314,9 +327,9 @@ if __name__ == "__main__":
     print(f"Found {len(valid_repos)} valid repositories: {', '.join(valid_repos)}")
 
     if DEBUG_MODE:
-        devs = [DEBUG_DEV]
-        repos = [DEBUG_REPO]
-        print(f"Debug Mode: Testing {DEBUG_DEV} on {DEBUG_REPO}")
+        devs = [DEBUG_DEV] if DEBUG_DEV else devs
+        repos = [DEBUG_REPO] if DEBUG_REPO in valid_repos else valid_repos
+        print(f"Debug Mode: Testing {devs[0]} on {repos[0]}")
 
     print(f"Generating report for {since} to {until} across branches {TARGET_BRANCHES}")
     report = generate_report(devs, valid_repos, since, until)
