@@ -147,10 +147,10 @@ def get_commits_graphql(repos, author, since, until):
         query_parts = []
         for i, repo in enumerate(batch_repos):
             org, repo_name = repo.split('/')
-            branch_query = " ".join(TARGET_BRANCHES)  # Combine target branches into a space-separated string
+            branch_query = " ".join(TARGET_BRANCHES)
             query_parts.append(
                 f'repo{i}: repository(owner: "{org}", name: "{repo_name}") {{\n'
-                f'  refs(refPrefix: "refs/heads/", first: {len(TARGET_BRANCHES)}, query: "{branch_query}") {{\n'  # Filter branches
+                f'  refs(refPrefix: "refs/heads/", first: {len(TARGET_BRANCHES)}, query: "{branch_query}") {{\n'
                 f'    nodes {{\n'
                 f'      name\n'
                 f'      target {{\n'
@@ -224,10 +224,10 @@ def get_commits_graphql(repos, author, since, until):
                 history = ref.get("target", {}).get("history", {}).get("nodes", [])
                 if not history and DEBUG_MODE:
                     print(f"No commits found in {repo} on branch {branch_name} between {since} and {until}")
-                for commit in history:
-                    if commit is None:
+                for commit in history or []:  # Handle null history
+                    if not isinstance(commit, dict):  # Check if commit is a valid dict
                         if DEBUG_MODE:
-                            print(f"Skipping null commit in {repo} on branch {branch_name}")
+                            print(f"Skipping invalid commit in {repo} on branch {branch_name}: {commit}")
                         continue
                     commit_login = commit.get("author", {}).get("user", {}).get("login", "")
                     commit_email_raw = commit.get("author", {}).get("email", "")
@@ -238,7 +238,7 @@ def get_commits_graphql(repos, author, since, until):
                         print(f"Commit in {repo}: login={commit_login or 'None'}, email_raw={commit_email_raw or 'None'}, email={commit_email or 'None'}, name={commit_name or 'None'}")
                     if commit_email and commit_email.lower() == author.lower():
                         commit_data = {
-                            "sha": commit["oid"],
+                            "sha": commit.get("oid", ""),
                             "stats": {
                                 "additions": commit.get("additions", 0),
                                 "deletions": commit.get("deletions", 0),
@@ -364,7 +364,7 @@ if __name__ == "__main__":
     
     since, until = get_time_range()
     devs = load_file_lines(DEVS_FILE)
-    repos = get_org_repos(ORGANIZATION) if USE_ORG_RECouldn'tPOS else load_file_lines(REPOS_FILE)
+    repos = get_org_repos(ORGANIZATION) if USE_ORG_REPOS else load_file_lines(REPOS_FILE)
 
     print("Probing repositories...")
     valid_repos = probe_repositories(repos)
